@@ -1,0 +1,5 @@
+﻿variant,accuracy
+full,95.27±1.54
+no_graph,89.79±2.48
+no_neighbor,94.77±1.57
+mlp_only,80.02±2.47

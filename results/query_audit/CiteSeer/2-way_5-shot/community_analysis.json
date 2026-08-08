@@ -1,0 +1,35 @@
+{
+  "analysis": "minimum post-hoc community query audit",
+  "dataset": "CiteSeer",
+  "setting": "2-way 5-shot",
+  "training_performed": false,
+  "community_detection": {
+    "algorithm": "Louvain",
+    "implementation": "networkx.community.louvain_communities",
+    "networkx_version": "3.5",
+    "resolution": 1.0,
+    "threshold": 1e-07,
+    "random_seed": 42,
+    "weight": null,
+    "num_communities": 470,
+    "num_singleton_communities": 48,
+    "num_nodes": 3327,
+    "num_edges": 4552
+  },
+  "density": {
+    "definition": "2 * internal_edges / (n * (n - 1))",
+    "singleton_handling": "density undefined; singleton communities excluded from density-exposure Spearman only"
+  },
+  "uniform_null": {
+    "distribution": "sum of event-level multivariate hypergeometric draws",
+    "candidate_nodes": 3327,
+    "queries_per_event": 200,
+    "sampling_events": 500,
+    "simulations": 1000,
+    "base_seed": 2025,
+    "sampling_design_seed": 1472908735,
+    "interval": "empirical 2.5th and 97.5th percentiles"
+  },
+  "run_level_summary_interval": "mean +/- 1.96 * sample SD / sqrt(number of runs)",
+  "summary_null_interval": "2.5th and 97.5th percentiles of 10,000 resampled null means, each using the same number of runs as the observation"
+}

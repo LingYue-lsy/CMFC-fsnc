@@ -1,0 +1,10 @@
+# Local datasets and generated model artifacts are kept outside source control.
+dataset/
+dataset.zip
+checkpoints/
+
+# Local development and Python cache files.
+.idea/
+__pycache__/
+**/__pycache__/
+*.py[cod]

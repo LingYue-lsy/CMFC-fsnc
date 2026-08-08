@@ -1,0 +1,4 @@
+﻿view_pair,linear_cka,cosine_similarity
+MLP-Graph,0.8978±0.0002,0.9739±0.0001
+MLP-Neighbor,0.9122±0.0003,0.9466±0.0003
+Graph-Neighbor,0.8961±0.0001,0.9759±0.0001

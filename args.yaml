@@ -1,18 +1,28 @@
 DEFAULT: &DEFAULT
-  black_list: [4,5,6]
-  num_gpus_total: 8
-  num_gpus_to_use: 1
   verbose: 2
   save_plot: False
   val_interval: 1
 
 CMFC: &CMFC
   model_name: CMFC
+  dataset_name: CoraFull
+  device: auto
+  gpu_id: 0
+  n: 5
+  k: 3
+  seed: 1
+  num_runs: 5
+  margin1: 0.8
+  support_selection: cosine
+  m: 5
+  sweep_enabled: True
+  sweep_parameter: margin2
+  sweep_values: [0.1, 0.3, 0.5, 0.7, 0.9]
+  sweep_output_dir: results
   <<: *DEFAULT
 
 CMFC-Cora: &CMFC-Cora
   <<: *CMFC
-  black_list: [4,5,6]
   lr: 0.005
   out_heads: 1
   task_type: Node_Transductive
@@ -40,7 +50,6 @@ CMFC-Cora-classification: &CMFC-Cora-E
 
 CMFC-CiteSeer: &CMFC-CiteSeer
   <<: *CMFC
-  black_list: [4,5,6]
   lr: 0.005
   out_heads: 1
   task_type: Node_Transductive
@@ -58,11 +67,11 @@ CMFC-CiteSeer-classification: &CMFC-CiteSeer-E
   w_loss1: 0.5
   w_loss2: 0.5
   w_loss3: 1
-  cfg : [128]
+  cfg : [512, 128]
   margin1: 0.8
   margin2: 0.2
   NewATop: 10
-  NN: 5
+  NN: 4
   num1: 100
   wd: 0.05
   weight_decay: 0.0001
@@ -74,7 +83,7 @@ CMFC-CS: &CMFC-CS
   <<: *CMFC
   lr: 0.0005
   epochs: 2000
-  seed: 3
+  seed: 1  # 原来是3
   task_num: 100
   dim: 128
   w_loss1: 5
@@ -104,7 +113,7 @@ CMFC-CoraFull: &CMFC-CoraFull
   w_loss1: 10
   w_loss2: 10
   w_loss3: 1
-  cfg : [1024, 256]
+  cfg : [512, 128]
   margin1: 0.8
   margin2: 0.4
   NN: 4
@@ -121,7 +130,6 @@ CMFC-CoraFull-classification:
 
 CMFC-Computers: &CMFC-Computers
   <<: *CMFC
-  black_list: [4,5,6]
   lr: 0.01
   out_heads: 1
   task_type: Node_Transductive
@@ -142,16 +150,10 @@ CMFC-Computers-classification:
   cfg: [512, 128]
   NewATop: 0
   dropout: 0.1
-  NN: 5
+  NN: 4
   num1: 300
   wd: 0.0
   weight_decay: 0.0001
-
-
-
-
-
-
 
 
 

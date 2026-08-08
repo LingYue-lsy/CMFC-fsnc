@@ -24,11 +24,14 @@ def get_args(model_name, dataset_class, dataset_name, custom_key="", yaml_path=N
     """
     yaml_path = yaml_path or os.path.join(os.path.dirname(os.path.realpath(__file__)), "args.yaml")
     custom_key = custom_key.split("+")[0]
+    with open(yaml_path, encoding="utf-8") as args_file:
+        yaml_config = YAML().load(args_file)
+
+    model_defaults = yaml_config.get(model_name, {})
+    dataset_name = model_defaults.get("dataset_name", dataset_name)
+
     parser = argparse.ArgumentParser(description='Parser for Simple Unsupervised Graph Representation Learning')
     # Basics
-    parser.add_argument("--num-gpus-total", default=0, type=int)
-    parser.add_argument("--num-gpus-to-use", default=0, type=int)
-    parser.add_argument("--black-list", default=None, type=int, nargs="+")
     parser.add_argument("--checkpoint_dir", default="checkpoints")
     parser.add_argument("--model_name", default=model_name)
     parser.add_argument("--custom_key", default=custom_key)
@@ -37,6 +40,8 @@ def get_args(model_name, dataset_class, dataset_name, custom_key="", yaml_path=N
     parser.add_argument('--data-root', default="~/graph-data", metavar='DIR', help='path to dataset')
     parser.add_argument("--dataset-class", default=dataset_class)
     parser.add_argument("--dataset-name", default=dataset_name)
+    parser.add_argument('--device', choices=['auto', 'cuda', 'cpu'], default='auto')
+    parser.add_argument('--gpu-id', '--gpu_id', dest='gpu_id', type=int, default=0)
     # Pretrain
     parser.add_argument("--pretrain", default=False, type=bool)
     # Training
@@ -64,6 +69,30 @@ def get_args(model_name, dataset_class, dataset_name, custom_key="", yaml_path=N
     parser.add_argument('--q', type=int, default=20, help='')
     parser.add_argument('--task_num', type=int, default=50, help='')
     parser.add_argument('--num_runs', type=int, default=20, help='')
+    parser.add_argument('--m', type=int, default=5,
+                        help='number of sampled neighbors to aggregate')
+    parser.add_argument(
+        '--sweep-enabled',
+        '--sweep_enabled',
+        dest='sweep_enabled',
+        action='store_true',
+        default=False,
+        help='enable a single-parameter sweep',
+    )
+    parser.add_argument('--sweep-parameter', '--sweep_parameter',
+                        dest='sweep_parameter', default='m')
+    parser.add_argument('--sweep-values', '--sweep_values',
+                        dest='sweep_values', nargs='+', default=[])
+    parser.add_argument('--sweep-output-dir', '--sweep_output_dir',
+                        dest='sweep_output_dir', default='results')
+    parser.add_argument(
+        '--support-selection',
+        '--support_selection',
+        dest='support_selection',
+        default='cosine',
+        choices=['cosine', 'euclidean', 'random'],
+        help='strategy used to choose top-k pseudo support nodes',
+    )
 
     parser.add_argument('--use_val_set', type=bool, default=False, help='')
     parser.add_argument('--early_stopping', type=bool, default=False, help='')
@@ -74,13 +103,12 @@ def get_args(model_name, dataset_class, dataset_name, custom_key="", yaml_path=N
 
     
     # Experiment specific parameters loaded from .yamls
-    with open(yaml_path) as args_file:
-        args = parser.parse_args()
-        args_key = "-".join([args.model_name, args.dataset_name or args.dataset_class, args.custom_key])
-        try:
-            parser.set_defaults(**dict(YAML().load(args_file)[args_key].items()))
-        except KeyError:
-            raise AssertionError("KeyError: there's no {} in yamls".format(args_key), "red")
+    args = parser.parse_args()
+    args_key = "-".join([args.model_name, args.dataset_name or args.dataset_class, args.custom_key])
+    try:
+        parser.set_defaults(**dict(yaml_config[args_key].items()))
+    except KeyError:
+        raise AssertionError("KeyError: there's no {} in yamls".format(args_key), "red")
     
     # Update params from .yamls
     args = parser.parse_args()
@@ -111,4 +139,4 @@ def print_args_as_table(args):
     print(line)
     for row in rows:
         print(row)
-    print("\n") 
+    print("\n")
