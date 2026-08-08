@@ -5,10 +5,10 @@ DEFAULT: &DEFAULT
 
 CMFC: &CMFC
   model_name: CMFC
-  dataset_name: CoraFull
+  dataset_name: Computers
   device: auto
   gpu_id: 0
-  n: 5
+  n: 2
   k: 3
   seed: 1
   num_runs: 5
