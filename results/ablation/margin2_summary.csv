@@ -1,0 +1,10 @@
+dataset,margin2,accuracy_percent
+CiteSeer,0.1,86.670000
+CiteSeer,0.3,86.185000
+Computers,0.3,96.430000
+Cora,0.1,90.775000
+Cora,0.3,89.965000
+CoraFull,0.3,80.390000
+CoraFull,0.7,82.308000
+CS,0.3,94.458000
+CS,0.5,94.874000
