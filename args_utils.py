@@ -72,20 +72,6 @@ def get_args(model_name, dataset_class, dataset_name, custom_key="", yaml_path=N
     parser.add_argument('--m', type=int, default=5,
                         help='number of sampled neighbors to aggregate')
     parser.add_argument(
-        '--sweep-enabled',
-        '--sweep_enabled',
-        dest='sweep_enabled',
-        action='store_true',
-        default=False,
-        help='enable a single-parameter sweep',
-    )
-    parser.add_argument('--sweep-parameter', '--sweep_parameter',
-                        dest='sweep_parameter', default='m')
-    parser.add_argument('--sweep-values', '--sweep_values',
-                        dest='sweep_values', nargs='+', default=[])
-    parser.add_argument('--sweep-output-dir', '--sweep_output_dir',
-                        dest='sweep_output_dir', default='results')
-    parser.add_argument(
         '--support-selection',
         '--support_selection',
         dest='support_selection',

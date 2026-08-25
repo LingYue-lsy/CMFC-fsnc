@@ -15,10 +15,6 @@ CMFC: &CMFC
   margin1: 0.8
   support_selection: cosine
   m: 5
-  sweep_enabled: True
-  sweep_parameter: margin2
-  sweep_values: [0.1, 0.3, 0.5, 0.7, 0.9]
-  sweep_output_dir: results
   <<: *DEFAULT
 
 CMFC-Cora: &CMFC-Cora

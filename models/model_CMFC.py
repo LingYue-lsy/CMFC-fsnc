@@ -3,60 +3,75 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
+def make_mlp(in_channels, cfg, dropout):
+    """Build the online and exponential-moving-average MLPs."""
+    if not cfg:
+        raise ValueError("cfg must contain at least the output dimension.")
 
-def make_mlplayers(in_channel, cfg, batch_norm=False, out_layer=None):
     layers = []
-    in_channels = in_channel
-    layer_num  = len(cfg)
-    for i, v in enumerate(cfg):
-        out_channels =  v
-        mlp = nn.Linear(in_channels, out_channels)
-        if batch_norm:
-            layers += [mlp, nn.BatchNorm1d(out_channels, affine=False), nn.ReLU()]
-        elif i != (layer_num-1):
-            layers += [mlp, nn.ReLU()]
-        else:
-            layers += [mlp]
-        in_channels = out_channels
-    if out_layer is not None:
-        mlp = nn.Linear(in_channels, out_layer)
-        layers += [mlp]
+    current_channels = in_channels
+    final_index = len(cfg) - 1
+
+    for index, out_channels in enumerate(cfg):
+        layers.append(nn.Linear(current_channels, out_channels))
+        if index != final_index:
+            layers.extend([nn.ReLU(), nn.Dropout(dropout)])
+        current_channels = out_channels
+
     return nn.Sequential(*layers)
 
+
 class CMFC_Fast(nn.Module):
+    """CMFC encoder with an EMA MLP and layer-wise graph propagation.
+
+    The online and EMA MLPs have identical architectures. The structural
+    branch reuses the EMA projection weights and performs normalized graph
+    propagation at every layer; it has no independent trainable parameters.
+    """
+
     def __init__(self, n_in, cfg=None, dropout=0.2, momentum=0.99):
         super().__init__()
-        self.MLP = make_mlplayers(n_in, cfg)  # 第一个MLP，正常更新权重
-        self.MLP_ema = make_mlplayers(n_in, cfg)  # 第二个MLP，权重由第一个MLP的移动平均得到
-        self.momentum = momentum
+        if cfg is None:
+            raise ValueError("cfg must be provided.")
+
+        self.cfg = tuple(cfg)
         self.dropout = dropout
-        
-        for m in self.modules():
-            self.weights_init(m)
-            
+        self.momentum = momentum
+        self.MLP = make_mlp(n_in, self.cfg, dropout)
+        self.MLP_ema = make_mlp(n_in, self.cfg, dropout)
+
+        for module in self.modules():
+            self.weights_init(module)
+
         self._copy_weights()
-        
-        # EMA MLP不参与梯度更新
         self.MLP_ema.requires_grad_(False)
 
     @torch.no_grad()
     def _copy_weights(self):
-        """初始化时复制主MLP的权重到EMA MLP"""
-        for param_q, param_k in zip(self.MLP.parameters(), self.MLP_ema.parameters()):
-            param_k.copy_(param_q)
-    
+        for online_parameter, ema_parameter in zip(
+            self.MLP.parameters(),
+            self.MLP_ema.parameters(),
+        ):
+            ema_parameter.copy_(online_parameter)
+
     @torch.no_grad()
     def _update_ema_weights(self):
-        """更新EMA MLP的权重"""
-        for param_q, param_k in zip(self.MLP.parameters(), self.MLP_ema.parameters()):
-            param_k.mul_(self.momentum)
-            param_k.add_(param_q, alpha=1.0 - self.momentum)
+        for online_parameter, ema_parameter in zip(
+            self.MLP.parameters(),
+            self.MLP_ema.parameters(),
+        ):
+            ema_parameter.mul_(self.momentum)
+            ema_parameter.add_(
+                online_parameter,
+                alpha=1.0 - self.momentum,
+            )
 
-    def weights_init(self, m):
-        if isinstance(m, nn.Linear):
-            nn.init.xavier_uniform_(m.weight)
-            if m.bias is not None:
-                nn.init.zeros_(m.bias)
+    @staticmethod
+    def weights_init(module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
 
     @staticmethod
     def _aggregate(adj, embeddings):
@@ -64,27 +79,39 @@ class CMFC_Fast(nn.Module):
             return torch.mm(adj, embeddings)
         return torch.sparse.mm(adj, embeddings)
 
-    def forward(self, seq_a, adj=None):
-        seq_a = F.dropout(seq_a, self.dropout, training=self.training)
+    def _ema_gcn(self, features, adj):
+        """Apply normalized graph propagation layer by layer."""
+        h = features
+        for layer in self.MLP_ema:
+            if isinstance(layer, nn.Linear):
+                # Reuse the EMA projection matrix without an extra branch.
+                h = F.linear(h, layer.weight, bias=None)
+                h = self._aggregate(adj, h)
+                h = F.relu(h)
+        return h
 
-        # 第一个MLP：正常更新权重
+    def forward(self, seq_a, adj=None):
+        if adj is None:
+            raise ValueError("adj must be provided.")
+
+        # Dropout is applied only after hidden activations.
         h_a = self.MLP(seq_a)
-        
-        # 更新EMA MLP的权重
+
         if self.training:
             self._update_ema_weights()
-        
-        # 使用EMA MLP进行图卷积（GCN与EMA MLP共享权重）
+
         with torch.no_grad():
             h_a_ema = self.MLP_ema(seq_a)
-            h_p = self._aggregate(adj, h_a_ema)
-        
+            h_p = self._ema_gcn(seq_a, adj)
+
         return h_a, h_p, h_a_ema
 
     def embed(self, seq_a, adj=None):
-        # 推理时使用EMA MLP
+        if adj is None:
+            raise ValueError("adj must be provided.")
+
         with torch.no_grad():
             h_a_ema = self.MLP_ema(seq_a)
-            h_p = self._aggregate(adj, h_a_ema)
-            
+            h_p = self._ema_gcn(seq_a, adj)
+
         return h_a_ema, h_p, h_a_ema

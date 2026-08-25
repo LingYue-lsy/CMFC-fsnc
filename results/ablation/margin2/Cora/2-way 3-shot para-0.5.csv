@@ -1,7 +1,0 @@
-﻿record_type,run,seed,train_split,validation_split,test_split,accuracy_percent,mean_accuracy_percent,confidence_interval_95_percent
-run,1,1,"{""type"":""classes"",""values"":[0,1,6]}","{""type"":""classes"",""values"":[3,5]}","{""type"":""classes"",""values"":[2,4]}",98.550000,,
-run,2,1001,"{""type"":""classes"",""values"":[1,2,4]}","{""type"":""classes"",""values"":[0,5]}","{""type"":""classes"",""values"":[3,6]}",86.875000,,
-run,3,2001,"{""type"":""classes"",""values"":[0,1,2]}","{""type"":""classes"",""values"":[3,5]}","{""type"":""classes"",""values"":[4,6]}",88.150000,,
-run,4,3001,"{""type"":""classes"",""values"":[2,4,6]}","{""type"":""classes"",""values"":[3,5]}","{""type"":""classes"",""values"":[0,1]}",93.350000,,
-run,5,4001,"{""type"":""classes"",""values"":[1,2,6]}","{""type"":""classes"",""values"":[0,5]}","{""type"":""classes"",""values"":[3,4]}",81.000000,,
-summary,,,,,,,89.585000,5.224817
