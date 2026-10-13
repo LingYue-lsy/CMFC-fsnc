@@ -26,13 +26,20 @@ class DatasetMasks:
 
 
 @dataclass
+class NeighborTable:
+    indices: torch.Tensor
+    offsets: torch.Tensor
+    degrees: torch.Tensor
+
+
+@dataclass
 class PreparedGraph:
     dataset_name: str
     features: torch.Tensor
     adjacency: torch.Tensor
     labels: torch.Tensor
     labels_cpu: torch.Tensor
-    neighbor_table: torch.Tensor
+    neighbor_table: NeighborTable
     num_features: int
     num_nodes: int
     default_masks: DatasetMasks | None
@@ -100,21 +107,14 @@ def build_normalized_sparse_adjacency(edge_index, num_nodes):
     ).coalesce()
 
 
-def build_neighbor_table(adjacency, sample_count=100):
+def build_neighbor_table(adjacency):
+    """Store every distinct neighbor, including the existing self-loops."""
+    adjacency = adjacency.coalesce()
     row, col = adjacency.indices()
     num_nodes = adjacency.size(0)
     degrees = torch.bincount(row, minlength=num_nodes)
     offsets = torch.cumsum(degrees, dim=0) - degrees
-    sample_steps = torch.arange(
-        1,
-        sample_count + 1,
-        device=adjacency.device,
-    ).unsqueeze(1)
-    positions = offsets.unsqueeze(0) + torch.remainder(
-        sample_steps,
-        degrees.unsqueeze(0),
-    )
-    return col[positions]
+    return NeighborTable(indices=col, offsets=offsets, degrees=degrees)
 
 # 类别划分
 def make_class_split_masks(labels, args, train_num, val_num):
@@ -325,12 +325,40 @@ def aggregate_sampled_neighbors(
     epoch,
     neighbor_count,
 ):
-    sample_rows = (
-        epoch
-        + 2 * torch.arange(neighbor_count, device=topk_indices.device)
-    ) % neighbor_table.size(0)
-    sampled_node_indices = neighbor_table[sample_rows][:, topk_indices]
-    return node_embeddings[sampled_node_indices].mean(dim=0)
+    """Uniformly sample up to m distinct neighbors for each support occurrence."""
+    if neighbor_count <= 0:
+        raise ValueError(f"m must be a positive integer, got {neighbor_count}.")
+
+    support_indices = topk_indices.reshape(-1)
+    degrees = neighbor_table.degrees[support_indices]
+    max_degree = int(degrees.max().item())
+    positions = torch.arange(max_degree, device=topk_indices.device)
+    valid_neighbors = positions.unsqueeze(0) < degrees.unsqueeze(1)
+
+    # Independent random priorities give a uniform subset without replacement.
+    # Re-sample on every call; epoch is retained for existing callers.
+    priorities = torch.rand(
+        valid_neighbors.shape,
+        dtype=torch.float64,
+        device=topk_indices.device,
+    ).masked_fill_(~valid_neighbors, -torch.inf)
+    sampled_positions = priorities.topk(
+        min(neighbor_count, max_degree), dim=1,
+    ).indices
+    valid_samples = sampled_positions < degrees.unsqueeze(1)
+    sampled_positions = sampled_positions.masked_fill(~valid_samples, 0)
+    sampled_node_indices = neighbor_table.indices[
+        neighbor_table.offsets[support_indices].unsqueeze(1)
+        + sampled_positions
+    ]
+    sampled_embeddings = node_embeddings[sampled_node_indices]
+    sampled_embeddings = sampled_embeddings.masked_fill(
+        ~valid_samples.unsqueeze(-1), 0,
+    )
+    aggregated = sampled_embeddings.sum(dim=1) / valid_samples.sum(
+        dim=1, keepdim=True,
+    )
+    return aggregated.reshape(*topk_indices.shape, node_embeddings.size(-1))
 
 
 def compute_batched_distances(
@@ -739,6 +767,70 @@ def run_repeated_experiment(
     return mean_accuracy, confidence_interval
 
 
+def coerce_sweep_value(value, current_value):
+    if isinstance(current_value, bool):
+        if isinstance(value, bool):
+            return value
+        normalized = str(value).strip().lower()
+        if normalized in {'true', '1', 'yes'}:
+            return True
+        if normalized in {'false', '0', 'no'}:
+            return False
+        raise ValueError(f"Cannot convert {value!r} to bool.")
+
+    return type(current_value)(value)
+
+
+def save_sweep_results(csv_path, parameter_name, rows):
+    with open(csv_path, 'w', newline='', encoding='utf-8-sig') as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow([parameter_name, 'accuracy'])
+        writer.writerows(rows)
+
+
+def run_parameter_sweep(args, gpu_id):
+    parameter_name = args.sweep_parameter
+    if not parameter_name or parameter_name.startswith('sweep_'):
+        raise ValueError(f"Invalid sweep parameter: {parameter_name!r}.")
+    if not hasattr(args, parameter_name):
+        raise ValueError(f"Unknown sweep parameter: {parameter_name!r}.")
+    if not args.sweep_values:
+        raise ValueError("sweep_values must contain at least one value.")
+
+    current_value = getattr(args, parameter_name)
+    sweep_values = [
+        coerce_sweep_value(value, current_value) for value in args.sweep_values
+    ]
+
+    os.makedirs(args.sweep_output_dir, exist_ok=True)
+    csv_name = (
+        f"{args.dataset_name}_{args.n}-way_{args.k}-shot_"
+        f"{parameter_name}.csv"
+    )
+    csv_path = osp.join(args.sweep_output_dir, csv_name)
+    summary_rows = []
+    graph_cache = {}
+    save_sweep_results(csv_path, parameter_name, summary_rows)
+
+    for value in sweep_values:
+        sweep_args = copy.deepcopy(args)
+        setattr(sweep_args, parameter_name, value)
+        print(f"\n{'=' * 30}\nSweep: {parameter_name}={value}\n{'=' * 30}")
+
+        mean_accuracy, confidence_interval = run_repeated_experiment(
+            sweep_args,
+            gpu_id,
+            graph_cache,
+        )
+        formatted_accuracy = f"{mean_accuracy:.2f}±{confidence_interval:.2f}"
+        summary_rows.append([value, formatted_accuracy])
+        save_sweep_results(csv_path, parameter_name, summary_rows)
+        print(f"{parameter_name}={value}: {formatted_accuracy}")
+
+    print(f"\nSweep results saved to: {csv_path}")
+    return summary_rows
+
+
 if __name__ == '__main__':
     main_args = get_args(
         model_name="CMFC",
@@ -751,14 +843,17 @@ if __name__ == '__main__':
     running_device = resolve_configured_device(main_args)
     print(f"Using device: {running_device}")
 
-    mean_accuracy, confidence_interval = run_repeated_experiment(
-        main_args,
-        running_device,
-        result_path=result_csv_path(main_args),
-    )
-    print(
-        f"\n{'=' * 30}\n"
-        f"Final Results over {main_args.num_runs} runs:\n"
-        f"Acc: {mean_accuracy:.2f}% ± {confidence_interval:.2f}%\n"
-        f"{'=' * 30}"
-    )
+    if getattr(main_args, 'sweep_enabled', False):
+        run_parameter_sweep(main_args, running_device)
+    else:
+        mean_accuracy, confidence_interval = run_repeated_experiment(
+            main_args,
+            running_device,
+            result_path=result_csv_path(main_args),
+        )
+        print(
+            f"\n{'=' * 30}\n"
+            f"Final Results over {main_args.num_runs} runs:\n"
+            f"Acc: {mean_accuracy:.2f}% ± {confidence_interval:.2f}%\n"
+            f"{'=' * 30}"
+        )
