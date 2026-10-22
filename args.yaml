@@ -18,7 +18,7 @@ CMFC-Cora-classification:
   w_loss2: 5
   w_loss3: 1
   cfg: [512, 128]
-  margin2: 0.2
+  margin2: 0.3
   NN: 4
   weight_decay: 5e-05
   dropout: 0.3
@@ -32,7 +32,7 @@ CMFC-CiteSeer-classification:
   w_loss2: 0.5
   w_loss3: 1
   cfg: [512, 128]
-  margin2: 0.2
+  margin2: 0.3
   NN: 4
   weight_decay: 0.0001
   dropout: 0.1
@@ -46,7 +46,7 @@ CMFC-CoraFull-classification:
   w_loss2: 10
   w_loss3: 1
   cfg: [512, 128]
-  margin2: 0.4
+  margin2: 0.3
   NN: 4
   weight_decay: 5e-05
   dropout: 0.3
@@ -60,20 +60,19 @@ CMFC-CS-classification:
   w_loss2: 5
   w_loss3: 1
   cfg: [512, 128]
-  margin2: 0.4
+  margin2: 0.3
   NN: 4
   weight_decay: 5e-05
   dropout: 0.1
 
 CMFC-Computers-classification:
   <<: *CMFC
-  margin1: 0.4
   lr: 0.01
   epochs: 2500
   w_loss1: 5
   w_loss2: 5
   w_loss3: 1
-  margin2: 0.6
+  margin2: 0.3
   cfg: [512, 128]
   dropout: 0.1
   NN: 4

@@ -36,7 +36,7 @@ def get_args(argv=None):
     parser.add_argument("--save-model", "--save_model", dest="save_model", action="store_true")
     integer_defaults = {"n": 2, "k": 1, "q": 20, "seed": 1, "num_runs": 5,
                         "epochs": 1000, "task_num": 50, "m": 5, "NN": 4}
-    float_defaults = {"lr": 0.005, "margin1": 0.8, "margin2": 0.2,
+    float_defaults = {"lr": 0.005, "margin1": 0.8, "margin2": 0.3,
                       "w_loss1": 5.0, "w_loss2": 5.0, "w_loss3": 1.0,
                       "weight_decay": 0.00005, "dropout": 0.3}
     for name, default in integer_defaults.items():
@@ -186,13 +186,20 @@ class DatasetMasks:
 
 
 @dataclass
+class NeighborTable:
+    indices: torch.Tensor
+    offsets: torch.Tensor
+    degrees: torch.Tensor
+
+
+@dataclass
 class PreparedGraph:
     dataset_name: str
     features: torch.Tensor
     adjacency: torch.Tensor
     labels: torch.Tensor
     labels_cpu: torch.Tensor
-    neighbor_table: torch.Tensor
+    neighbor_table: NeighborTable
     num_features: int
     num_nodes: int
 
@@ -259,21 +266,15 @@ def build_normalized_sparse_adjacency(edge_index, num_nodes):
     ).coalesce()
 
 
-def build_neighbor_table(adjacency, sample_count=100):
+def build_neighbor_table(adjacency):
+    """Store each node's unique one-hop candidates, including its self-loop."""
     row, col = adjacency.indices()
     num_nodes = adjacency.size(0)
     degrees = torch.bincount(row, minlength=num_nodes)
     offsets = torch.cumsum(degrees, dim=0) - degrees
-    sample_steps = torch.arange(
-        1,
-        sample_count + 1,
-        device=adjacency.device,
-    ).unsqueeze(1)
-    positions = offsets.unsqueeze(0) + torch.remainder(
-        sample_steps,
-        degrees.unsqueeze(0),
-    )
-    return col[positions]
+    if torch.any(degrees == 0):
+        raise ValueError("Every node needs a candidate; add self-loops first.")
+    return NeighborTable(col, offsets, degrees)
 
 def make_class_split_masks(labels, args, train_num, val_num):
     num_classes = int(labels.max().item()) + 1
@@ -437,6 +438,25 @@ def select_support_indices(query_embs, candidate_embs, k):
     return torch.topk(scores, k=k, dim=1, largest=True).indices
 
 
+def sample_neighbor_indices(neighbor_table, node_indices, neighbor_count):
+    """Uniformly sample min(m, degree) candidates without replacement per node."""
+    if neighbor_count <= 0:
+        raise ValueError("neighbor_count must be positive")
+    degrees = neighbor_table.degrees[node_indices]
+    width = int(degrees.max().item())
+    positions = torch.arange(width, device=node_indices.device).unsqueeze(0)
+    valid = positions < degrees.unsqueeze(1)
+    keys = torch.rand(valid.shape, device=node_indices.device)
+    keys.masked_fill_(~valid, float('inf'))
+    selected = keys.topk(min(neighbor_count, width), dim=1, largest=False).indices
+    selected_valid = selected < degrees.unsqueeze(1)
+    # Invalid padding is never included in the sum; use a safe gather position.
+    csr_positions = neighbor_table.offsets[node_indices].unsqueeze(1) + selected
+    csr_positions = torch.where(selected_valid, csr_positions,
+                                neighbor_table.offsets[node_indices].unsqueeze(1))
+    return neighbor_table.indices[csr_positions], selected_valid
+
+
 def aggregate_sampled_neighbors(
     node_embeddings,
     topk_indices,
@@ -444,12 +464,14 @@ def aggregate_sampled_neighbors(
     epoch,
     neighbor_count,
 ):
-    sample_rows = (
-        epoch
-        + 2 * torch.arange(neighbor_count, device=topk_indices.device)
-    ) % neighbor_table.size(0)
-    sampled_node_indices = neighbor_table[sample_rows][:, topk_indices]
-    return node_embeddings[sampled_node_indices].mean(dim=0)
+    unique_nodes, inverse = torch.unique(topk_indices, return_inverse=True)
+    sampled_nodes, valid = sample_neighbor_indices(
+        neighbor_table, unique_nodes, neighbor_count,
+    )
+    weights = valid.to(node_embeddings.dtype).unsqueeze(-1)
+    aggregated = (node_embeddings[sampled_nodes] * weights).sum(dim=1)
+    aggregated = aggregated / valid.sum(dim=1, keepdim=True)
+    return aggregated[inverse].reshape(*topk_indices.shape, node_embeddings.size(1))
 
 
 def compute_batched_distances(
@@ -523,11 +545,10 @@ def compute_batched_margin_terms(
         negative_expanded - support_expanded.detach() - mask_margin,
         min=0,
     )
-    return (
-        support_margin.mean(dim=1).sum(),
-        neighbor_margin.mean(dim=1).sum(),
-        mask_values.sum(),
-    )
+    # Paper objective: sum over query anchors and average over K positives and P negatives.
+    denominator = support_distances.size(1) * negative_distances.size(0)
+    return tuple(term.sum() / denominator for term in
+                 (support_margin, neighbor_margin, mask_values))
 
 
 def run_CMFC(
@@ -625,9 +646,11 @@ def run_CMFC(
             )
         )
 
-        loss_mar = task_loss_mar / (num_task_node * args.k) * 100
-        loss_mar_1 = task_loss_mar_1 / (num_task_node * args.k) * 100
-        mask_margin_N = task_mask_margin_N / (num_task_node * args.k * num_neg) * 100
+        # Average the N-anchor task objectives over the actual number of tasks in the batch.
+        num_tasks = num_task_node / args.n
+        loss_mar = task_loss_mar / num_tasks
+        loss_mar_1 = task_loss_mar_1 / num_tasks
+        mask_margin_N = task_mask_margin_N / num_tasks
          
         loss = loss_mar * args.w_loss1 + loss_mar_1 * args.w_loss2 + mask_margin_N * args.w_loss3
         loss.backward()
