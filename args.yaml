@@ -1,160 +1,80 @@
-DEFAULT: &DEFAULT
-  verbose: 2
-  save_plot: False
-  val_interval: 1
-
 CMFC: &CMFC
-  model_name: CMFC
-  dataset_name: Computers
+  dataset_name: Cora
   device: auto
   gpu_id: 0
   n: 2
-  k: 3
+  k: 1
   seed: 1
   num_runs: 5
   margin1: 0.8
-  support_selection: cosine
   m: 5
-  <<: *DEFAULT
 
-CMFC-Cora: &CMFC-Cora
+CMFC-Cora-classification:
   <<: *CMFC
   lr: 0.005
-  out_heads: 1
-  task_type: Node_Transductive
-  val_interval: 1
-
-CMFC-Cora-classification: &CMFC-Cora-E
-  <<: *CMFC-Cora
   epochs: 1000
   task_num: 50
-  dim: 128
-  dim_x: 4
-  w_loss1: 5 
-  w_loss2: 5 
-  w_loss3: 1
-  cfg : [512, 128]
-  margin1: 0.8
-  margin2: 0.2 
-  NN: 4
-  num1: 100
-  wd: 0.005
-  weight_decay: 0.00005
-  dropout: 0.3
-
-
-
-CMFC-CiteSeer: &CMFC-CiteSeer
-  <<: *CMFC
-  lr: 0.005
-  out_heads: 1
-  task_type: Node_Transductive
-  val_interval: 1
-
-CMFC-CiteSeer-classification: &CMFC-CiteSeer-E
-  <<: *CMFC-CiteSeer
-  lr: 0.005
-  task_type: Node_Transductive
-  val_interval: 1
-  epochs: 500
-  task_num: 100
-  dim: 128
-  dim_x: 4
-  w_loss1: 0.5
-  w_loss2: 0.5
-  w_loss3: 1
-  cfg : [512, 128]
-  margin1: 0.8
-  margin2: 0.2
-  NewATop: 10
-  NN: 4
-  num1: 100
-  wd: 0.05
-  weight_decay: 0.0001
-  dropout: 0.1
-
-
-
-CMFC-CS: &CMFC-CS
-  <<: *CMFC
-  lr: 0.0005
-  epochs: 2000
-  seed: 1  # 原来是3
-  task_num: 100
-  dim: 128
   w_loss1: 5
   w_loss2: 5
   w_loss3: 1
-  cfg : [512, 128]
-  margin1: 0.8
-  margin2: 0.4
+  cfg: [512, 128]
+  margin2: 0.2
   NN: 4
-  num1: 200
-  wd: 0.005
-  weight_decay: 0.00005
+  weight_decay: 5e-05
+  dropout: 0.3
+
+CMFC-CiteSeer-classification:
+  <<: *CMFC
+  lr: 0.005
+  epochs: 500
+  task_num: 100
+  w_loss1: 0.5
+  w_loss2: 0.5
+  w_loss3: 1
+  cfg: [512, 128]
+  margin2: 0.2
+  NN: 4
+  weight_decay: 0.0001
   dropout: 0.1
 
-CMFC-CS-classification:
-  <<: *CMFC-CS
-  dim_x: 4
-  task_type: Node_Transductive
-  val_interval: 1
-
-CMFC-CoraFull: &CMFC-CoraFull
+CMFC-CoraFull-classification:
   <<: *CMFC
   lr: 0.0025
   epochs: 2000
   task_num: 100
-  dim: 256
   w_loss1: 10
   w_loss2: 10
   w_loss3: 1
-  cfg : [512, 128]
-  margin1: 0.8
+  cfg: [512, 128]
   margin2: 0.4
   NN: 4
-  num1: 200
-  wd: 0.005
-  weight_decay: 0.00005
+  weight_decay: 5e-05
   dropout: 0.3
 
-CMFC-CoraFull-classification:
-  <<: *CMFC-CoraFull
-  dim_x: 8
-  task_type: Node_Transductive
-  val_interval: 1
-
-CMFC-Computers: &CMFC-Computers
+CMFC-CS-classification:
   <<: *CMFC
-  lr: 0.01
-  out_heads: 1
-  task_type: Node_Transductive
-  val_interval: 1
-  num_hidden_features: 8
-  epochs: 500
-  to_undirected_at_neg: True
+  lr: 0.0005
+  epochs: 2000
+  task_num: 100
+  w_loss1: 5
+  w_loss2: 5
+  w_loss3: 1
+  cfg: [512, 128]
+  margin2: 0.4
+  NN: 4
+  weight_decay: 5e-05
+  dropout: 0.1
 
 CMFC-Computers-classification:
-  <<: *CMFC-Computers
+  <<: *CMFC
+  margin1: 0.4
+  lr: 0.01
   epochs: 2500
   w_loss1: 5
   w_loss2: 5
   w_loss3: 1
-  margin1: 0.4
   margin2: 0.6
-  dim: 128
   cfg: [512, 128]
-  NewATop: 0
   dropout: 0.1
   NN: 4
-  num1: 300
-  wd: 0.0
   weight_decay: 0.0001
-
-
-
-
-
-
-
-

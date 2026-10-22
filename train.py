@@ -4,6 +4,10 @@ import csv
 from dataclasses import dataclass
 import json
 import random
+import argparse
+from pathlib import Path
+from ruamel.yaml import YAML
+import torch.nn as nn
 import torch
 from torch_geometric.utils import coalesce, to_undirected
 import os.path as osp
@@ -11,11 +15,167 @@ import torch.nn.functional as F
 import numpy as np
 from tqdm import tqdm
 from torch_geometric.datasets import Amazon, CitationFull, Coauthor, Planetoid
-from models import CMFC_Fast
 import os
 from sklearn.linear_model import LogisticRegression
 from termcolor import cprint
-from args_utils import get_args, pprint_args
+
+
+def get_args(argv=None):
+    """Load dataset defaults and apply explicit command-line overrides."""
+    base = Path(__file__).resolve().parent
+    with (base / "args.yaml").open(encoding="utf-8") as stream:
+        config = YAML(typ="safe").load(stream)
+    datasets = ("Cora", "CiteSeer", "CoraFull", "CS", "Computers")
+    parser = argparse.ArgumentParser(description="CMFC self-supervised few-shot node classification")
+    parser.add_argument("--dataset-name", choices=datasets, default=config["CMFC"]["dataset_name"])
+    parser.add_argument("--device", choices=("auto", "cuda", "cpu"), default="auto")
+    parser.add_argument("--gpu-id", "--gpu_id", dest="gpu_id", type=int, default=0)
+    parser.add_argument("--data-root", default=str(base / "dataset"))
+    parser.add_argument("--output-dir", default=str(base / "res"))
+    parser.add_argument("--checkpoint_dir", default=str(base / "checkpoints"))
+    parser.add_argument("--save-model", "--save_model", dest="save_model", action="store_true")
+    integer_defaults = {"n": 2, "k": 1, "q": 20, "seed": 1, "num_runs": 5,
+                        "epochs": 1000, "task_num": 50, "m": 5, "NN": 4}
+    float_defaults = {"lr": 0.005, "margin1": 0.8, "margin2": 0.2,
+                      "w_loss1": 5.0, "w_loss2": 5.0, "w_loss3": 1.0,
+                      "weight_decay": 0.00005, "dropout": 0.3}
+    for name, default in integer_defaults.items():
+        parser.add_argument("--" + name, type=int, default=default)
+    for name, default in float_defaults.items():
+        parser.add_argument("--" + name, type=float, default=default)
+    parser.add_argument("--cfg", type=int, nargs="+", default=[512, 128])
+    selected, _ = parser.parse_known_args(argv)
+    defaults = dict(config["CMFC"])
+    defaults.update(config["CMFC-" + selected.dataset_name + "-classification"])
+    allowed = {action.dest for action in parser._actions}
+    unknown = set(defaults) - allowed
+    if unknown:
+        parser.error("Unsupported configuration keys: " + ", ".join(sorted(unknown)))
+    parser.set_defaults(**defaults)
+    args = parser.parse_args(argv)
+    for name in integer_defaults:
+        if name != "seed" and getattr(args, name) <= 0:
+            parser.error(name + " must be positive")
+    return args
+
+
+def pprint_args(args):
+    print("========== CONFIG ==========")
+    for name, value in sorted(vars(args).items()):
+        print(f"{name}: {value}")
+    print("============================")
+
+
+def make_mlp(in_channels, cfg, dropout):
+    """Build the online and exponential-moving-average MLPs."""
+    if not cfg:
+        raise ValueError("cfg must contain at least the output dimension.")
+
+    layers = []
+    current_channels = in_channels
+    final_index = len(cfg) - 1
+
+    for index, out_channels in enumerate(cfg):
+        layers.append(nn.Linear(current_channels, out_channels))
+        if index != final_index:
+            layers.extend([nn.ReLU(), nn.Dropout(dropout)])
+        current_channels = out_channels
+
+    return nn.Sequential(*layers)
+
+
+class CMFC_Fast(nn.Module):
+    """CMFC encoder with an EMA MLP and layer-wise graph propagation.
+
+    The online and EMA MLPs have identical architectures. The structural
+    branch reuses the EMA projection weights and performs normalized graph
+    propagation at every layer; it has no independent trainable parameters.
+    """
+
+    def __init__(self, n_in, cfg=None, dropout=0.2, momentum=0.99):
+        super().__init__()
+        if cfg is None:
+            raise ValueError("cfg must be provided.")
+
+        self.cfg = tuple(cfg)
+        self.dropout = dropout
+        self.momentum = momentum
+        self.MLP = make_mlp(n_in, self.cfg, dropout)
+        self.MLP_ema = make_mlp(n_in, self.cfg, dropout)
+
+        for module in self.modules():
+            self.weights_init(module)
+
+        self._copy_weights()
+        self.MLP_ema.requires_grad_(False)
+
+    @torch.no_grad()
+    def _copy_weights(self):
+        for online_parameter, ema_parameter in zip(
+            self.MLP.parameters(),
+            self.MLP_ema.parameters(),
+        ):
+            ema_parameter.copy_(online_parameter)
+
+    @torch.no_grad()
+    def _update_ema_weights(self):
+        for online_parameter, ema_parameter in zip(
+            self.MLP.parameters(),
+            self.MLP_ema.parameters(),
+        ):
+            ema_parameter.mul_(self.momentum)
+            ema_parameter.add_(
+                online_parameter,
+                alpha=1.0 - self.momentum,
+            )
+
+    @staticmethod
+    def weights_init(module):
+        if isinstance(module, nn.Linear):
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.zeros_(module.bias)
+
+    @staticmethod
+    def _aggregate(adj, embeddings):
+        return torch.sparse.mm(adj, embeddings)
+
+    def _ema_gcn(self, features, adj):
+        """Apply normalized graph propagation layer by layer."""
+        h = features
+        for layer in self.MLP_ema:
+            if isinstance(layer, nn.Linear):
+                # Reuse the EMA projection matrix without an extra branch.
+                h = F.linear(h, layer.weight, bias=None)
+                h = self._aggregate(adj, h)
+                h = F.relu(h)
+        return h
+
+    def forward(self, seq_a, adj=None):
+        if adj is None:
+            raise ValueError("adj must be provided.")
+
+        # Dropout is applied only after hidden activations.
+        h_a = self.MLP(seq_a)
+
+        if self.training:
+            self._update_ema_weights()
+
+        with torch.no_grad():
+            h_a_ema = self.MLP_ema(seq_a)
+            h_p = self._ema_gcn(seq_a, adj)
+
+        return h_a, h_p, h_a_ema
+
+    def embed(self, seq_a, adj=None):
+        if adj is None:
+            raise ValueError("adj must be provided.")
+
+        with torch.no_grad():
+            h_a_ema = self.MLP_ema(seq_a)
+            h_p = self._ema_gcn(seq_a, adj)
+
+        return h_a_ema, h_p, h_a_ema
 
 
 @dataclass
@@ -26,23 +186,15 @@ class DatasetMasks:
 
 
 @dataclass
-class NeighborTable:
-    indices: torch.Tensor
-    offsets: torch.Tensor
-    degrees: torch.Tensor
-
-
-@dataclass
 class PreparedGraph:
     dataset_name: str
     features: torch.Tensor
     adjacency: torch.Tensor
     labels: torch.Tensor
     labels_cpu: torch.Tensor
-    neighbor_table: NeighborTable
+    neighbor_table: torch.Tensor
     num_features: int
     num_nodes: int
-    default_masks: DatasetMasks | None
 
 
 def resolve_device(gpu_id=None):
@@ -107,16 +259,22 @@ def build_normalized_sparse_adjacency(edge_index, num_nodes):
     ).coalesce()
 
 
-def build_neighbor_table(adjacency):
-    """Store every distinct neighbor, including the existing self-loops."""
-    adjacency = adjacency.coalesce()
+def build_neighbor_table(adjacency, sample_count=100):
     row, col = adjacency.indices()
     num_nodes = adjacency.size(0)
     degrees = torch.bincount(row, minlength=num_nodes)
     offsets = torch.cumsum(degrees, dim=0) - degrees
-    return NeighborTable(indices=col, offsets=offsets, degrees=degrees)
+    sample_steps = torch.arange(
+        1,
+        sample_count + 1,
+        device=adjacency.device,
+    ).unsqueeze(1)
+    positions = offsets.unsqueeze(0) + torch.remainder(
+        sample_steps,
+        degrees.unsqueeze(0),
+    )
+    return col[positions]
 
-# 类别划分
 def make_class_split_masks(labels, args, train_num, val_num):
     num_classes = int(labels.max().item()) + 1
     all_classes = torch.arange(num_classes)
@@ -127,10 +285,10 @@ def make_class_split_masks(labels, args, train_num, val_num):
     val_classes = shuffled_classes[train_num:train_num + val_num]
     test_classes = shuffled_classes[train_num + val_num:]
 
-    print("数据集类别划分:")
-    print(f"训练集类别: {train_classes.tolist()}")
-    print(f"验证集类别: {val_classes.tolist()}")
-    print(f"测试集类别: {test_classes.tolist()}")
+    print("Dataset class split:")
+    print(f"Training classes: {train_classes.tolist()}")
+    print(f"Validation classes: {val_classes.tolist()}")
+    print(f"Test classes: {test_classes.tolist()}")
 
     train_mask = torch.isin(labels, train_classes)
     val_mask = torch.isin(labels, val_classes)
@@ -177,11 +335,7 @@ def masks_for_run(prepared_graph, args):
         )
     if prepared_graph.dataset_name == 'CoraFull':
         return make_cora_full_masks(labels, args)
-    if prepared_graph.default_masks is None:
-        raise AttributeError(
-            f"Dataset {prepared_graph.dataset_name!r} has no evaluation masks."
-        )
-    return prepared_graph.default_masks
+    raise ValueError(f"Unsupported dataset: {prepared_graph.dataset_name!r}.")
 
 
 def describe_mask_split(labels, mask):
@@ -215,14 +369,11 @@ def describe_dataset_split(prepared_graph, masks):
 
 
 def get_dataset(args):
-    if args.dataset_name in ['Cora', 'CiteSeer', 'PubMed', 'Photo', 'Computers', 'CoraFull', 'CS']:
-        path = osp.join(osp.dirname(osp.realpath(__file__)), 'dataset/')
-        if args.dataset_name in ['Cora', 'CiteSeer', 'PubMed']:
+    if args.dataset_name in ['Cora', 'CiteSeer', 'Computers', 'CoraFull', 'CS']:
+        path = str(Path(args.data_root).expanduser().resolve())
+        if args.dataset_name in ['Cora', 'CiteSeer']:
             dataset = Planetoid(path, args.dataset_name)
             data = dataset[0]
-        elif args.dataset_name == 'Photo':
-            dataset = Amazon(path, args.dataset_name, pre_transform=None) 
-            data = dataset[0] 
         elif args.dataset_name == 'Computers':
             dataset = Amazon(path, args.dataset_name, pre_transform=None)  
             data = dataset[0]
@@ -253,16 +404,6 @@ def prepare_graph(args, running_device):
     data, adjacency = get_dataset(args)
     labels_cpu = data.y.long().cpu()
 
-    default_masks = None
-    mask_values = [
-        getattr(data, name, None)
-        for name in ('train_mask', 'val_mask', 'test_mask')
-    ]
-    if all(isinstance(mask, torch.Tensor) for mask in mask_values):
-        default_masks = DatasetMasks(
-            *(mask.cpu().clone() for mask in mask_values),
-        )
-
     adjacency = adjacency.to(running_device).coalesce()
     prepared_graph = PreparedGraph(
         dataset_name=args.dataset_name,
@@ -273,7 +414,6 @@ def prepare_graph(args, running_device):
         neighbor_table=build_neighbor_table(adjacency),
         num_features=data.num_features,
         num_nodes=data.num_nodes,
-        default_masks=default_masks,
     )
     cprint("## Done ##", "yellow")
     return prepared_graph
@@ -287,35 +427,14 @@ def get_cached_prepared_graph(args, gpu_id, graph_cache):
     return graph_cache[cache_key]
 
 
-def select_support_indices(query_embs, candidate_embs, k, strategy):
+def select_support_indices(query_embs, candidate_embs, k):
+    """Select pseudo supports by cross-branch cosine similarity."""
     if k > candidate_embs.size(0):
-        raise ValueError(
-            f"k={k} is larger than the number of candidate support nodes "
-            f"({candidate_embs.size(0)})."
-        )
-
-    if strategy == 'cosine':
-        query_norm = F.normalize(query_embs, p=2, dim=1)
-        candidate_norm = F.normalize(candidate_embs, p=2, dim=1)
-        scores = torch.mm(query_norm, candidate_norm.t())
-        _, topk_indices = torch.topk(scores, k=k, dim=1, largest=True)
-    elif strategy == 'euclidean':
-        distances = torch.cdist(query_embs, candidate_embs, p=2)
-        _, topk_indices = torch.topk(distances, k=k, dim=1, largest=False)
-    elif strategy == 'random':
-        random_scores = torch.rand(
-            query_embs.size(0),
-            candidate_embs.size(0),
-            device=query_embs.device,
-        )
-        _, topk_indices = torch.topk(random_scores, k=k, dim=1, largest=True)
-    else:
-        raise ValueError(
-            "support_selection must be one of: cosine, euclidean, random. "
-            f"Got {strategy!r}."
-        )
-
-    return topk_indices
+        raise ValueError("k exceeds the number of candidate nodes.")
+    query_norm = F.normalize(query_embs, p=2, dim=1)
+    candidate_norm = F.normalize(candidate_embs, p=2, dim=1)
+    scores = torch.mm(query_norm, candidate_norm.t())
+    return torch.topk(scores, k=k, dim=1, largest=True).indices
 
 
 def aggregate_sampled_neighbors(
@@ -325,40 +444,12 @@ def aggregate_sampled_neighbors(
     epoch,
     neighbor_count,
 ):
-    """Uniformly sample up to m distinct neighbors for each support occurrence."""
-    if neighbor_count <= 0:
-        raise ValueError(f"m must be a positive integer, got {neighbor_count}.")
-
-    support_indices = topk_indices.reshape(-1)
-    degrees = neighbor_table.degrees[support_indices]
-    max_degree = int(degrees.max().item())
-    positions = torch.arange(max_degree, device=topk_indices.device)
-    valid_neighbors = positions.unsqueeze(0) < degrees.unsqueeze(1)
-
-    # Independent random priorities give a uniform subset without replacement.
-    # Re-sample on every call; epoch is retained for existing callers.
-    priorities = torch.rand(
-        valid_neighbors.shape,
-        dtype=torch.float64,
-        device=topk_indices.device,
-    ).masked_fill_(~valid_neighbors, -torch.inf)
-    sampled_positions = priorities.topk(
-        min(neighbor_count, max_degree), dim=1,
-    ).indices
-    valid_samples = sampled_positions < degrees.unsqueeze(1)
-    sampled_positions = sampled_positions.masked_fill(~valid_samples, 0)
-    sampled_node_indices = neighbor_table.indices[
-        neighbor_table.offsets[support_indices].unsqueeze(1)
-        + sampled_positions
-    ]
-    sampled_embeddings = node_embeddings[sampled_node_indices]
-    sampled_embeddings = sampled_embeddings.masked_fill(
-        ~valid_samples.unsqueeze(-1), 0,
-    )
-    aggregated = sampled_embeddings.sum(dim=1) / valid_samples.sum(
-        dim=1, keepdim=True,
-    )
-    return aggregated.reshape(*topk_indices.shape, node_embeddings.size(-1))
+    sample_rows = (
+        epoch
+        + 2 * torch.arange(neighbor_count, device=topk_indices.device)
+    ) % neighbor_table.size(0)
+    sampled_node_indices = neighbor_table[sample_rows][:, topk_indices]
+    return node_embeddings[sampled_node_indices].mean(dim=0)
 
 
 def compute_batched_distances(
@@ -439,26 +530,11 @@ def compute_batched_margin_terms(
     )
 
 
-def training_epoch_range(args):
-    total_epochs = int(args.epochs)
-    start_epoch = int(args.start_epoch)
-    if total_epochs <= 0:
-        raise ValueError(f"epochs must be positive, got {total_epochs}.")
-    if start_epoch < 0 or start_epoch >= total_epochs:
-        raise ValueError(
-            "start_epoch must satisfy 0 <= start_epoch < epochs, got "
-            f"start_epoch={start_epoch}, epochs={total_epochs}."
-        )
-    return range(start_epoch, total_epochs)
-
-
 def run_CMFC(
     args,
     gpu_id=None,
-    run_id=0,
     prepared_graph=None,
     masks=None,
-    **kwargs,
 ):
     if args.m <= 0:
         raise ValueError(f"m must be a positive integer, got {args.m}.")
@@ -495,9 +571,8 @@ def run_CMFC(
     my_margin_2 = my_margin + args.margin2
     num_neg = args.NN
         
-    # 训练过程
     start = t()
-    for epoch in tqdm(training_epoch_range(args)):
+    for epoch in tqdm(range(args.epochs)):
         model.train()
         optimiser.zero_grad()
         h_a, h_p, h_a2 = model(feature_X, A_I_nomal)
@@ -517,12 +592,10 @@ def run_CMFC(
 
         h_a_task = h_a[task_node_index]  
 
-        # 计算 Top-k 邻居用于构建正样本对
         topk_indices = select_support_indices(
             h_a_task,
             h_a2,
             args.k,
-            args.support_selection,
         )
         neighbor_embeddings = aggregate_sampled_neighbors(
             h_a2,
@@ -532,7 +605,6 @@ def run_CMFC(
             args.m,
         )
 
-        # 计算邻居表征 (h_nei)
         support_distances, neighbor_distances, negative_distances = (
             compute_batched_distances(
                 h_a_task,
@@ -571,19 +643,18 @@ def run_CMFC(
         prepared_graph,
         masks.test,
         args,
-        "最终测试集",
+        "Final test set",
     )
     noe = t()
     print('total time', noe - start)
     return result
 
-# 测试评估
 def evaluate_on_test_set(
     model,
     prepared_graph,
     test_mask,
     args,
-    eval_type="测试集",
+    eval_type="Test set",
 ):
     model.eval()
     with torch.no_grad():
@@ -653,9 +724,9 @@ def evaluate_on_test_set(
         final_interval = 1.96 * (final_std / np.sqrt(len(test_acc_all)))
 
         print(
-            f"\n{eval_type}评估结果: {n_way}-way {args.k}-shot "
-            f"(q={args.q}) 准确率: {final_mean * 100:.2f}"
-            f"±{final_interval * 100:.2f}%"
+            f"\n{eval_type} results: {n_way}-way {args.k}-shot "
+            f"(q={args.q}) accuracy: {final_mean * 100:.2f}"
+            f"+/-{final_interval * 100:.2f}%"
         )
         return final_mean * 100
     return None
@@ -676,8 +747,7 @@ RESULT_COLUMNS = [
 
 def result_csv_path(args):
     result_dir = osp.join(
-        osp.dirname(osp.realpath(__file__)),
-        'res',
+        args.output_dir,
         str(args.dataset_name),
     )
     return osp.join(result_dir, f'{args.n}-way {args.k}-shot.csv')
@@ -727,7 +797,6 @@ def run_repeated_experiment(
         run_result = run_CMFC(
             run_args,
             gpu_id=gpu_id,
-            run_id=run,
             prepared_graph=prepared_graph,
             masks=masks,
         )
@@ -767,93 +836,21 @@ def run_repeated_experiment(
     return mean_accuracy, confidence_interval
 
 
-def coerce_sweep_value(value, current_value):
-    if isinstance(current_value, bool):
-        if isinstance(value, bool):
-            return value
-        normalized = str(value).strip().lower()
-        if normalized in {'true', '1', 'yes'}:
-            return True
-        if normalized in {'false', '0', 'no'}:
-            return False
-        raise ValueError(f"Cannot convert {value!r} to bool.")
-
-    return type(current_value)(value)
-
-
-def save_sweep_results(csv_path, parameter_name, rows):
-    with open(csv_path, 'w', newline='', encoding='utf-8-sig') as csv_file:
-        writer = csv.writer(csv_file)
-        writer.writerow([parameter_name, 'accuracy'])
-        writer.writerows(rows)
-
-
-def run_parameter_sweep(args, gpu_id):
-    parameter_name = args.sweep_parameter
-    if not parameter_name or parameter_name.startswith('sweep_'):
-        raise ValueError(f"Invalid sweep parameter: {parameter_name!r}.")
-    if not hasattr(args, parameter_name):
-        raise ValueError(f"Unknown sweep parameter: {parameter_name!r}.")
-    if not args.sweep_values:
-        raise ValueError("sweep_values must contain at least one value.")
-
-    current_value = getattr(args, parameter_name)
-    sweep_values = [
-        coerce_sweep_value(value, current_value) for value in args.sweep_values
-    ]
-
-    os.makedirs(args.sweep_output_dir, exist_ok=True)
-    csv_name = (
-        f"{args.dataset_name}_{args.n}-way_{args.k}-shot_"
-        f"{parameter_name}.csv"
-    )
-    csv_path = osp.join(args.sweep_output_dir, csv_name)
-    summary_rows = []
-    graph_cache = {}
-    save_sweep_results(csv_path, parameter_name, summary_rows)
-
-    for value in sweep_values:
-        sweep_args = copy.deepcopy(args)
-        setattr(sweep_args, parameter_name, value)
-        print(f"\n{'=' * 30}\nSweep: {parameter_name}={value}\n{'=' * 30}")
-
-        mean_accuracy, confidence_interval = run_repeated_experiment(
-            sweep_args,
-            gpu_id,
-            graph_cache,
-        )
-        formatted_accuracy = f"{mean_accuracy:.2f}±{confidence_interval:.2f}"
-        summary_rows.append([value, formatted_accuracy])
-        save_sweep_results(csv_path, parameter_name, summary_rows)
-        print(f"{parameter_name}={value}: {formatted_accuracy}")
-
-    print(f"\nSweep results saved to: {csv_path}")
-    return summary_rows
-
-
 if __name__ == '__main__':
-    main_args = get_args(
-        model_name="CMFC",
-        dataset_class="Planetoid",
-        dataset_name=None,
-        custom_key="classification",
-    )
+    main_args = get_args()
 
     pprint_args(main_args)
     running_device = resolve_configured_device(main_args)
     print(f"Using device: {running_device}")
 
-    if getattr(main_args, 'sweep_enabled', False):
-        run_parameter_sweep(main_args, running_device)
-    else:
-        mean_accuracy, confidence_interval = run_repeated_experiment(
-            main_args,
-            running_device,
-            result_path=result_csv_path(main_args),
-        )
-        print(
-            f"\n{'=' * 30}\n"
-            f"Final Results over {main_args.num_runs} runs:\n"
-            f"Acc: {mean_accuracy:.2f}% ± {confidence_interval:.2f}%\n"
-            f"{'=' * 30}"
-        )
+    mean_accuracy, confidence_interval = run_repeated_experiment(
+        main_args,
+        running_device,
+        result_path=result_csv_path(main_args),
+    )
+    print(
+        f"\n{'=' * 30}\n"
+        f"Final Results over {main_args.num_runs} runs:\n"
+        f"Acc: {mean_accuracy:.2f}% +/- {confidence_interval:.2f}%\n"
+        f"{'=' * 30}"
+    )
